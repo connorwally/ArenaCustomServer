@@ -1,70 +1,185 @@
-﻿using ArenaShared.Net;
-using System.Net.WebSockets;
-using System.Text.Json;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+using LiteNetLib;
+using LiteNetLib.Utils;
+using MessagePack;
 
-var builder = WebApplication.CreateBuilder(args);
-
-var port = Environment.GetEnvironmentVariable("ARENA_PORT") is { } s && int.TryParse(s, out var result) ? result : 5000;
-builder.WebHost.UseKestrel(o => o.ListenAnyIP(port));
-
-var app = builder.Build();
-
-app.Lifetime.ApplicationStarted.Register(() =>
+public sealed class GameServer : INetEventListener
 {
-    Console.WriteLine($"ArenaServer running on ws://0.0.0.0:{port}/ws (Ctrl+C to stop)");
-});
+    private readonly NetManager _server;
+    private readonly int _port;
+    private readonly CancellationToken _stopToken;
 
-app.UseWebSockets();
-app.Map("/ws", async ctx =>
-{
-    if (!ctx.WebSockets.IsWebSocketRequest)
+    // Track connected peers
+    private readonly ConcurrentDictionary<NetPeer, Guid> _peerSessions = new();
+    
+    // Resuable writer to avoid per-send allocations
+    private readonly NetDataWriter _writer = new();
+
+    public GameServer(int port, CancellationToken stopToken)
     {
-        ctx.Response.StatusCode = 400;
-        return;
+        _port = port;
+        _stopToken = stopToken;
+        MessagePackSerializer.DefaultOptions =
+            MessagePackSerializerOptions.Standard.WithResolver(MessagePack.Resolvers.StandardResolver.Instance);
+
+        _server = new NetManager(this);
     }
 
-    using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-
-    var sessionId = Guid.NewGuid();
-    var buf = new byte[64 * 1024];
-    
-    var res = await ws.ReceiveAsync(buf, CancellationToken.None);
-    if (res.MessageType == WebSocketMessageType.Close) return;
-
-    var env = JsonSerializer.Deserialize<NetEnvelope>(buf.AsSpan(0, res.Count))!;
-    if (env.Op != OpCode.Hello)
+    public void Start()
     {
-        await ws.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Expected Hello", CancellationToken.None);
-        return;
-    }
-
-    var hello = JsonSerializer.Deserialize<Hello>(env.Payload)!;
-    Console.WriteLine($"HELLO from {hello.PlayerName} v{hello.ClientVersion} -> {sessionId}");
-    
-    var ack = new NetEnvelope(OpCode.HelloAck, JsonSerializer.SerializeToUtf8Bytes(new HelloAck(sessionId)));
-    await ws.SendAsync(JsonSerializer.SerializeToUtf8Bytes(ack), WebSocketMessageType.Text, true, CancellationToken.None);
-    
-    // Loop, reply to ping wiht pong
-    while (ws.State == WebSocketState.Open)
-    {
-        res = await ws.ReceiveAsync(buf, CancellationToken.None);
-        if (res.MessageType == WebSocketMessageType.Close) break;
-
-        env = JsonSerializer.Deserialize<NetEnvelope>(buf.AsSpan(0, res.Count))!;
-        switch (env.Op)
+        if (!_server.Start(_port))
         {
-            case OpCode.Ping:
-                var pong = new NetEnvelope(OpCode.Pong, env.Payload);
-                await ws.SendAsync(JsonSerializer.SerializeToUtf8Bytes(pong), WebSocketMessageType.Text, true, CancellationToken.None);
-                break;
+            throw new Exception($"Failed to bind UDP port {_port}");
+        }
+        
+        Console.WriteLine($"ArenaServer (UDP) listening on udp://0.0.0.0:{_port} (Ctrl+C to stop)");
+        
+        // Main loop: pump events + example 30 Hz tick
+        const int tickRate = 30;
+        var tickIntervalMs = 1000 / tickRate;
+        var sw = Stopwatch.StartNew();
+        long nextTickAt = sw.ElapsedMilliseconds + tickIntervalMs;
+
+        while (!_stopToken.IsCancellationRequested)
+        {
+            _server.PollEvents();
             
-            // TODO: Handle move -> update world, periodically broadcast snapshot
+            // Tick @ 30 Hz
+            var now = sw.ElapsedMilliseconds;
+            if (now >= nextTickAt)
+            {
+                // TODO: Advance world, broadcast snapshots etc.
+                nextTickAt += tickIntervalMs;
+            }
+
+            Thread.Sleep(1);
+        }
+        
+        Console.WriteLine("Shutting down server...");
+        _server.Stop();
+    }
+
+    // ----------------------------------------------------------------------------------- INetEventListener
+
+    public void OnConnectionRequest(ConnectionRequest request)
+    {
+        request.Accept();
+    }
+
+    public void OnPeerConnected(NetPeer peer)
+    {
+        Console.WriteLine($"Peer connected: {peer.Address}:{peer.Port}");
+    }
+
+    public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
+    {
+        if (_peerSessions.TryRemove(peer, out var sessionId))
+        {
+            Console.WriteLine($"Session {sessionId} disconnected ({disconnectInfo.Reason})");
+        }
+        else
+        {
+            Console.WriteLine($"Peer {peer.Address}:{peer.Port} disconnected ({disconnectInfo.Reason})");
         }
     }
-    
-    Console.WriteLine($"Session {sessionId} disconnected");
-});
 
-await app.RunAsync();
+    public void OnNetworkError(IPEndPoint endPoint, SocketError socketError)
+    {
+        Console.WriteLine($"Network error {socketError} from {endPoint}");
+    }
+
+    public void OnNetworkReceiveUnconnected(IPEndPoint remoteEndPoint, NetPacketReader reader, UnconnectedMessageType messageType)
+    {
+        
+    }
+
+    public void OnNetworkLatencyUpdate(NetPeer peer, int latency)
+    {
+        
+    }
+
+    public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod)
+    {
+        try
+        {
+            var data = reader.GetRemainingBytes();
+            reader.Recycle();
+
+            var env = MessagePackSerializer.Deserialize<NetEnvelope>(data);
+
+            switch (env.Op)
+            {
+                case OpCode.Hello:
+                {
+                    var hello = MessagePackSerializer.Deserialize<Hello>(env.Payload);
+
+                    var sessionId = Guid.NewGuid();
+                    _peerSessions[peer] = sessionId;
+
+                    Console.WriteLine($"HELLO from {hello.PlayerName} v{hello.ClientVersion} -> {sessionId}");
+
+                    var ack = new NetEnvelope(OpCode.HelloAck,
+                        MessagePackSerializer.Serialize(new HelloAck{SessionId = sessionId}));
+
+                    SendEnvelope(peer, ack, DeliveryMethod.ReliableOrdered);
+                    break;
+                }
+
+                case OpCode.Ping:
+                {
+                    var pong = new NetEnvelope(OpCode.Pong, env.Payload);
+                    SendEnvelope(peer, pong, DeliveryMethod.ReliableOrdered);
+                    break;
+                }
+                case OpCode.HelloAck:
+                case OpCode.Pong:
+                case OpCode.Move:
+                case OpCode.Snapshot:
+                default:
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Receive error: {ex}");
+        }
+    }
+
+    // ----------------------------------------------------------------------------------- HELPERS
+
+    private void SendEnvelope(NetPeer peer, NetEnvelope env, DeliveryMethod method)
+    {
+        var bytes = MessagePackSerializer.Serialize(env);
+        
+        _writer.Reset();
+        _writer.Put(bytes);
+        peer.Send(_writer, channelNumber: 0, deliveryMethod: method);
+    }
+}
+
+public static class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var port = TryParseEnv("ARENA_PORT", 7979);
+        using var cts = new CancellationTokenSource();
+
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            cts.Cancel();
+        };
+
+        var server = new GameServer(port, cts.Token);
+        server.Start();
+
+        while (!cts.IsCancellationRequested)
+            await Task.Delay(100, cts.Token).ContinueWith(_ => { }, cts.Token);
+    }
+
+    private static int TryParseEnv(string name, int fallback) =>
+        Environment.GetEnvironmentVariable(name) is { } s && int.TryParse(s, out var v) ? v : fallback;
+}
