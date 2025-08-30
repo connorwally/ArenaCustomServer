@@ -1,0 +1,35 @@
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Mm]emoryCaptures/
+UserSettings/
+*.unityproj
+*.sln
+*.csproj
+*.pidb
+*.user
+*.booproj
+*.svd
+
+# VS/JetBrains IDE files
+.vscode/
+.idea/
+*.suo
+*.user
+*.userprefs
+*.csproj
+*.pidb
+*.booproj
+*.svd
+
+# Dotnet
+bin/
+obj/
+
+# OS junk
+.DS_Store
+Thumbs.db
